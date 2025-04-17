@@ -12,7 +12,6 @@ import time
 from log_config import setup_logging
 setup_logging()
 
-import logging
 logger = logging.getLogger(__name__)
 
 RETRY_TOTAL = int(os.getenv("SIGMA_RETRY_TOTAL", "5"))
@@ -148,6 +147,45 @@ class SigmaClient:
         self._submit_login()
         self._submit_pin()
 
+    def perform_action(self, action):
+        action_map = {
+            "arm": "arm.html",
+            "disarm": "disarm.html",
+            "stay": "stay.html"
+        }
+        if action not in action_map:
+            raise ValueError(f"Unknown action: {action}")
+
+        self.login()
+        logger.debug("Checking current alarm status before action...")
+        part_soup = self.select_partition(part_id='1')
+        current_status_data = self.get_part_status(part_soup)
+        current_status, _ = _parse_alarm_status(current_status_data['alarm_status'])
+
+        logger.info(f"Current alarm status: {current_status}")
+
+        if current_status == "Disarmed" and action in ("arm", "stay"):
+            pass  # allowed
+        elif current_status == "Armed" and action == "disarm":
+            pass  # allowed
+        elif current_status == "Armed" and action in ("arm", "stay"):
+            logger.warning("System is already armed. Cannot arm or perimeter arm again.")
+            return None
+        elif current_status == "Perimeter Armed" and action == "arm":
+            pass  # allowed to go from stay to full arm
+        elif current_status == "Perimeter Armed" and action in ("stay",):
+            logger.warning("System is already perimeter armed. Cannot perimeter arm again.")
+            return None
+        elif current_status == "Disarmed" and action == "disarm":
+            logger.warning("System is already disarmed.")
+            return None
+
+        url = f"{self.base_url}/{action_map[action]}"
+        logger.info(f"Performing alarm action '{action}' at URL: {url}")
+        resp = self.session.get(url)
+        resp.raise_for_status()
+        return resp
+
     @retry_html_request
     def select_partition(self, part_id='1'):
         logger.debug(f"Selecting partition {part_id}...")
@@ -203,46 +241,54 @@ class SigmaClient:
                     zones.append(zone_data)
         return zones
 
+if __name__ == "__main__":
+    BASE_URL = os.getenv("SIGMA_BASE_URL")
+    USERNAME = os.getenv("SIGMA_USERNAME")
+    PASSWORD = os.getenv("SIGMA_PASSWORD")
+    ACTION = os.getenv("SIGMA_ACTION")  # optional: arm, disarm, stay
 
-if __name__ == '__main__':
-    MAX_TOTAL_ATTEMPTS = 3
+    MAX_TOTAL_ATTEMPTS = int(os.getenv("SIGMA_MAX_ATTEMPTS", 3))
+
     for attempt in range(1, MAX_TOTAL_ATTEMPTS + 1):
         try:
-            logger.info(f"Attempt {attempt}/{MAX_TOTAL_ATTEMPTS} to fetch Sigma Alarm data")
-
+            logger.info(f"Attempt {attempt}/{MAX_TOTAL_ATTEMPTS} to interact with Sigma Alarm")
             client = SigmaClient(BASE_URL, USERNAME, PASSWORD)
-            client.login()
 
-            part_soup = client.select_partition(part_id='1')
-            status = client.get_part_status(part_soup)
-            zones = client.get_zones(part_soup)
+            if ACTION:
+                logger.info(f"Performing action: {ACTION}")
+                client.perform_action(ACTION)
+                print(json.dumps({"action": ACTION, "success": True}))
+            else:
+                client.login()
+                part_soup = client.select_partition(part_id='1')
+                status = client.get_part_status(part_soup)
+                zones = client.get_zones(part_soup)
 
-            parsed_status, zones_bypassed = _parse_alarm_status(status['alarm_status'])
+                parsed_status, zones_bypassed = _parse_alarm_status(status['alarm_status'])
 
-            if not parsed_status or status['battery_volt'] is None or not zones:
-                raise ValueError("Parsed data incomplete or invalid, retrying full flow")
+                if not parsed_status or status['battery_volt'] is None or not zones:
+                    raise ValueError("Parsed data incomplete or invalid, retrying full flow")
 
-            output = {
-                "status": parsed_status,
-                "zones_bypassed": zones_bypassed,
-                "battery_volt": status['battery_volt'],
-                "ac_power": _to_bool(status['ac_power']),
-                "zones": [
-                    {
-                        "zone": z['zone'],
-                        "description": z['description'],
-                        "status": _to_openclosed(z['status']),
-                        "bypass": _to_bool(z['bypass'])
-                    }
-                    for z in zones
-                ]
-            }
+                output = {
+                    "status": parsed_status,
+                    "zones_bypassed": zones_bypassed,
+                    "battery_volt": status['battery_volt'],
+                    "ac_power": _to_bool(status['ac_power']),
+                    "zones": [
+                        {
+                            "zone": z['zone'],
+                            "description": z['description'],
+                            "status": _to_openclosed(z['status']),
+                            "bypass": _to_bool(z['bypass'])
+                        }
+                        for z in zones
+                    ]
+                }
 
-            print(json.dumps(output, indent=2, ensure_ascii=False))
-            break  # ✅ Exit loop on success
+                print(json.dumps(output, indent=2, ensure_ascii=False))
+            break
 
         except Exception as e:
-            logger.warning(f"Full flow failed on attempt {attempt}: {e}")
+            logger.warning(f"Flow failed on attempt {attempt}: {e}")
             if attempt == MAX_TOTAL_ATTEMPTS:
                 logger.exception("Max retry attempts exceeded. Final failure.")
-
