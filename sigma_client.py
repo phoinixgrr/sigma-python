@@ -18,6 +18,7 @@ RETRY_TOTAL = int(os.getenv("SIGMA_RETRY_TOTAL", "5"))
 RETRY_BACKOFF_FACTOR = float(os.getenv("SIGMA_RETRY_BACKOFF", "0.5"))
 RETRY_STATUS_FORCELIST = [500, 502, 503, 504]
 RETRY_ATTEMPTS_FOR_HTML = int(os.getenv("SIGMA_RETRY_HTML", "5"))
+ACTION_ATTEMPTS = int(os.getenv("SIGMA_ACTION_MAX_ATTEMPTS", "5"))
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -72,12 +73,14 @@ def retry_html_request(func):
     return wrapper
 
 class SigmaClient:
-    def __init__(self, base_url, username, password):
+    def __init__(self, base_url, username, password, max_attempts=3):
         self.base_url = base_url.rstrip('/')
         self.username = username
         self.password = password
+        self.max_attempts = max_attempts
         self.session = requests.Session()
-
+        
+        # Retry setup
         retry = Retry(
             total=RETRY_TOTAL,
             backoff_factor=RETRY_BACKOFF_FACTOR,
@@ -153,38 +156,58 @@ class SigmaClient:
             "disarm": "disarm.html",
             "stay": "stay.html"
         }
+        expected_status_map = {
+            "arm": "Armed",
+            "stay": "Perimeter Armed",
+            "disarm": "Disarmed"
+        }
+
         if action not in action_map:
             raise ValueError(f"Unknown action: {action}")
 
-        self.login()
-        logger.debug("Checking current alarm status before action...")
-        part_soup = self.select_partition(part_id='1')
-        current_status_data = self.get_part_status(part_soup)
-        current_status, _ = _parse_alarm_status(current_status_data['alarm_status'])
+        expected_status = expected_status_map.get(action)
 
-        logger.info(f"Current alarm status: {current_status}")
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                logger.info(f"Action attempt {attempt}/{self.max_attempts}: {action}")
 
-        if current_status == "Disarmed" and action in ("arm", "stay"):
-            pass  # allowed
-        elif current_status == "Armed" and action == "disarm":
-            pass  # allowed
-        elif current_status == "Armed" and action in ("arm", "stay"):
-            logger.warning("System is already armed. Cannot arm or perimeter arm again.")
-            return None
-        elif current_status == "Perimeter Armed" and action == "arm":
-            pass  # allowed to go from stay to full arm
-        elif current_status == "Perimeter Armed" and action in ("stay",):
-            logger.warning("System is already perimeter armed. Cannot perimeter arm again.")
-            return None
-        elif current_status == "Disarmed" and action == "disarm":
-            logger.warning("System is already disarmed.")
-            return None
+                self.login()
+                logger.debug("Checking current alarm status before action...")
+                part_soup = self.select_partition(part_id='1')
+                current_status_data = self.get_part_status(part_soup)
+                current_status, _ = _parse_alarm_status(current_status_data['alarm_status'])
+                logger.info(f"Current alarm status: {current_status}")
 
-        url = f"{self.base_url}/{action_map[action]}"
-        logger.info(f"Performing alarm action '{action}' at URL: {url}")
-        resp = self.session.get(url)
-        resp.raise_for_status()
-        return resp
+                # Pre-check: skip redundant actions
+                if current_status == expected_status:
+                    logger.warning(f"System already in expected state '{expected_status}', skipping action.")
+                    return None
+
+                url = f"{self.base_url}/{action_map[action]}"
+                logger.info(f"Performing alarm action '{action}' at URL: {url}")
+                resp = self.session.get(url, timeout=5)
+                resp.raise_for_status()
+
+                logger.debug("Waiting before verifying alarm state...")
+                time.sleep(4)  # Give the panel a moment to reflect the change
+
+                part_soup = self.select_partition(part_id='1')
+                post_status_data = self.get_part_status(part_soup)
+                final_status, _ = _parse_alarm_status(post_status_data['alarm_status'])
+                logger.info(f"Post-action alarm status: {final_status}")
+
+                if final_status == expected_status:
+                    logger.info(f"Action '{action}' verified successfully.")
+                    return resp
+                else:
+                    raise ValueError(f"Expected status '{expected_status}' not reached after action. Got '{final_status}'.")
+
+            except Exception as e:
+                logger.warning(f"Action flow failed on attempt {attempt}: {e}")
+                time.sleep(RETRY_BACKOFF_FACTOR * (2 ** (attempt - 1)))
+                if attempt == self.max_attempts:
+                    logger.exception("Max action retry attempts exceeded. Final failure.")
+                    raise
 
     @retry_html_request
     def select_partition(self, part_id='1'):
@@ -247,12 +270,12 @@ if __name__ == "__main__":
     PASSWORD = os.getenv("SIGMA_PASSWORD")
     ACTION = os.getenv("SIGMA_ACTION")  # optional: arm, disarm, stay
 
-    MAX_TOTAL_ATTEMPTS = int(os.getenv("SIGMA_MAX_ATTEMPTS", 3))
+    MAX_TOTAL_ATTEMPTS = int(os.getenv("SIGMA_MAX_ATTEMPTS", 5))
 
     for attempt in range(1, MAX_TOTAL_ATTEMPTS + 1):
         try:
             logger.info(f"Attempt {attempt}/{MAX_TOTAL_ATTEMPTS} to interact with Sigma Alarm")
-            client = SigmaClient(BASE_URL, USERNAME, PASSWORD)
+            client = SigmaClient(BASE_URL, USERNAME, PASSWORD, max_attempts=MAX_TOTAL_ATTEMPTS)
 
             if ACTION:
                 logger.info(f"Performing action: {ACTION}")

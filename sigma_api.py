@@ -12,7 +12,7 @@ app = Flask(__name__)
 BASE_URL = os.getenv("SIGMA_BASE_URL")
 USERNAME = os.getenv("SIGMA_USERNAME")
 PASSWORD = os.getenv("SIGMA_PASSWORD")
-MAX_TOTAL_ATTEMPTS = int(os.getenv("SIGMA_MAX_ATTEMPTS", "3"))
+MAX_TOTAL_ATTEMPTS = int(os.getenv("SIGMA_MAX_ATTEMPTS", "5"))
 
 if not all([BASE_URL, USERNAME, PASSWORD]):
     raise ValueError("Environment variables SIGMA_BASE_URL, SIGMA_USERNAME, and SIGMA_PASSWORD must be set")
@@ -22,7 +22,7 @@ def get_sigma_status():
     for attempt in range(1, MAX_TOTAL_ATTEMPTS + 1):
         try:
             logger.info(f"Attempt {attempt}/{MAX_TOTAL_ATTEMPTS} to fetch Sigma Alarm data")
-            client = SigmaClient(BASE_URL, USERNAME, PASSWORD)
+            client = SigmaClient(BASE_URL, USERNAME, PASSWORD, max_attempts=MAX_TOTAL_ATTEMPTS)
             client.login()
             part_soup = client.select_partition(part_id='1')
             status = client.get_part_status(part_soup)
@@ -70,7 +70,7 @@ def arm_stay():
 
 def _perform_alarm_action(action):
     try:
-        client = SigmaClient(BASE_URL, USERNAME, PASSWORD)
+        client = SigmaClient(BASE_URL, USERNAME, PASSWORD, max_attempts=MAX_TOTAL_ATTEMPTS)
         client.perform_action(action)
         return jsonify({"success": True, "action": action}), 200
     except Exception as e:
