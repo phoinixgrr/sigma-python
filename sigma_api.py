@@ -17,27 +17,26 @@ MAX_TOTAL_ATTEMPTS = int(os.getenv("SIGMA_MAX_ATTEMPTS", "5"))
 if not all([BASE_URL, USERNAME, PASSWORD]):
     raise ValueError("Environment variables SIGMA_BASE_URL, SIGMA_USERNAME, and SIGMA_PASSWORD must be set")
 
+# Persistent SigmaClient across requests (thread-safe for dev, not production)
+client = SigmaClient(BASE_URL, USERNAME, PASSWORD, max_attempts=MAX_TOTAL_ATTEMPTS)
+
 @app.route("/status", methods=["GET"])
 def get_sigma_status():
     for attempt in range(1, MAX_TOTAL_ATTEMPTS + 1):
         try:
             logger.info(f"Attempt {attempt}/{MAX_TOTAL_ATTEMPTS} to fetch Sigma Alarm data")
-            client = SigmaClient(BASE_URL, USERNAME, PASSWORD, max_attempts=MAX_TOTAL_ATTEMPTS)
-            client.login()
-            part_soup = client.select_partition(part_id='1')
-            status = client.get_part_status(part_soup)
-            zones = client.get_zones(part_soup)
 
-            parsed_status, zones_bypassed = _parse_alarm_status(status['alarm_status'])
+            data = client.safe_get_status()
+            parsed_status, zones_bypassed = _parse_alarm_status(data['alarm_status'])
 
-            if not parsed_status or status['battery_volt'] is None or not zones:
+            if not parsed_status or data['battery_volt'] is None or not data['zones']:
                 raise ValueError("Parsed data incomplete or invalid, retrying full flow")
 
             output = {
                 "status": parsed_status,
                 "zones_bypassed": zones_bypassed,
-                "battery_volt": status['battery_volt'],
-                "ac_power": _to_bool(status['ac_power']),
+                "battery_volt": data['battery_volt'],
+                "ac_power": _to_bool(data['ac_power']),
                 "zones": [
                     {
                         "zone": z['zone'],
@@ -45,8 +44,9 @@ def get_sigma_status():
                         "status": _to_openclosed(z['status']),
                         "bypass": _to_bool(z['bypass'])
                     }
-                    for z in zones
-                ]
+                    for z in data['zones']
+                ],
+                "session_reused": getattr(client, "_session_authenticated", False)
             }
             return jsonify(output)
 
@@ -70,7 +70,6 @@ def arm_stay():
 
 def _perform_alarm_action(action):
     try:
-        client = SigmaClient(BASE_URL, USERNAME, PASSWORD, max_attempts=MAX_TOTAL_ATTEMPTS)
         client.perform_action(action)
         return jsonify({"success": True, "action": action}), 200
     except Exception as e:

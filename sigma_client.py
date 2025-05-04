@@ -79,7 +79,8 @@ class SigmaClient:
         self.password = password
         self.max_attempts = max_attempts
         self.session = requests.Session()
-        
+        self._session_authenticated = False  # ✅ Initialize here
+
         # Retry setup
         retry = Retry(
             total=RETRY_TOTAL,
@@ -149,6 +150,8 @@ class SigmaClient:
     def login(self):
         self._submit_login()
         self._submit_pin()
+        self._session_authenticated = True
+        logger.info("Session login completed and session is now marked as authenticated.")
 
     def perform_action(self, action):
         action_map = {
@@ -165,7 +168,7 @@ class SigmaClient:
         if action not in action_map:
             raise ValueError(f"Unknown action: {action}")
 
-        expected_status = expected_status_map.get(action)
+        expected_status = expected_status_map[action]
 
         for attempt in range(1, self.max_attempts + 1):
             try:
@@ -174,8 +177,8 @@ class SigmaClient:
                 self.login()
                 logger.debug("Checking current alarm status before action...")
                 part_soup = self.select_partition(part_id='1')
-                current_status_data = self.get_part_status(part_soup)
-                current_status, _ = _parse_alarm_status(current_status_data['alarm_status'])
+                pre_data = self.get_zones_with_status(part_soup)
+                current_status, _ = _parse_alarm_status(pre_data['alarm_status'])
                 logger.info(f"Current alarm status: {current_status}")
 
                 # Pre-check: skip redundant actions
@@ -183,24 +186,28 @@ class SigmaClient:
                     logger.warning(f"System already in expected state '{expected_status}', skipping action.")
                     return None
 
+                # Perform the action
                 url = f"{self.base_url}/{action_map[action]}"
                 logger.info(f"Performing alarm action '{action}' at URL: {url}")
                 resp = self.session.get(url, timeout=5)
                 resp.raise_for_status()
 
                 logger.debug("Waiting before verifying alarm state...")
-                time.sleep(4)  # Give the panel a moment to reflect the change
+                time.sleep(4)
 
+                # Check post-action status
                 part_soup = self.select_partition(part_id='1')
-                post_status_data = self.get_part_status(part_soup)
-                final_status, _ = _parse_alarm_status(post_status_data['alarm_status'])
+                post_data = self.get_zones_with_status(part_soup)
+                final_status, _ = _parse_alarm_status(post_data['alarm_status'])
                 logger.info(f"Post-action alarm status: {final_status}")
 
                 if final_status == expected_status:
                     logger.info(f"Action '{action}' verified successfully.")
                     return resp
                 else:
-                    raise ValueError(f"Expected status '{expected_status}' not reached after action. Got '{final_status}'.")
+                    raise ValueError(
+                        f"Expected status '{expected_status}' not reached after action. Got '{final_status}'."
+                    )
 
             except Exception as e:
                 logger.warning(f"Action flow failed on attempt {attempt}: {e}")
@@ -208,6 +215,7 @@ class SigmaClient:
                 if attempt == self.max_attempts:
                     logger.exception("Max action retry attempts exceeded. Final failure.")
                     raise
+
 
     @retry_html_request
     def select_partition(self, part_id='1'):
@@ -219,39 +227,78 @@ class SigmaClient:
         resp.raise_for_status()
         return BeautifulSoup(resp.text, 'html.parser')
 
-    @retry_html_request
-    def get_part_status(self, soup):
-        p_tag = soup.find('p')
-        alarm_status = None
-        if p_tag:
-            spans = p_tag.find_all('span')
-            if len(spans) >= 2:
-                alarm_status = spans[1].get_text(strip=True)
-        logger.debug(f"Extracted alarm_status: {alarm_status}")
+    def try_zones_directly(self):
+        if not self._session_authenticated:
+            logger.info("Session is not authenticated yet — skipping direct zones fetch.")
+            return None
 
-        text = soup.get_text("\n", strip=True)
-        battery = re.search(r"(\d+\.?\d*)\s*Volt", text)
-        ac = re.search(r"Παροχή\s*230V:\s*(ΝΑΙ|NAI|OXI|Yes|No)", text, re.IGNORECASE)
-        logger.debug(f"Extracted battery: {battery.group(1) if battery else None}, AC: {ac.group(1) if ac else None}")
-        return {
-            'alarm_status': alarm_status,
-            'battery_volt': float(battery.group(1)) if battery else None,
-            'ac_power': ac.group(1) if ac else None
-        }
+        try:
+            logger.info("Using existing session to fetch zones.html directly...")
+            part_soup = self.select_partition(part_id='1')
+            return self.get_zones_with_status(part_soup)
+        except Exception as e:
+            logger.warning(f"Direct zones.html fetch failed: {e}")
+            return None
+
+    def safe_get_status(self):
+        try:
+            data = self.try_zones_directly()
+
+            # General failure condition: treat any missing key parts as invalid
+            if not data or not data.get("alarm_status") or not data.get("zones"):
+                raise ValueError("zones.html fetch returned incomplete or invalid data")
+
+            logger.info("Successfully fetched data via existing session (zones.html).")
+            return data
+
+        except Exception as e:
+            logger.warning(f"Direct zones.html fetch failed or invalid: {e}")
+            logger.info("Fallback to full authentication flow...")
+            self.login()
+            part_soup = self.select_partition(part_id='1')
+            return self.get_zones_with_status(part_soup)
+
 
     @retry_html_request
-    def get_zones(self, soup):
+    def get_zones_with_status(self, soup):
         logger.debug("Getting zones...")
+
+        # Find the link to the zones page from the partition page
         link = soup.find('a', string=re.compile('ζωνών', re.I))
         url = link['href'] if link and link.get('href') else 'zones.html'
         full_url = f"{self.base_url}/{url.lstrip('/')}"
+
+        # Fetch zones.html
         resp = self.session.get(full_url, headers={'Referer': f"{self.base_url}/part.cgi"})
         resp.raise_for_status()
 
-        table = BeautifulSoup(resp.text, 'html.parser').find('table', class_='normaltable')
+        # 💥 DEBUG: Dump raw HTML to log file
+        with open("/tmp/zones_debug.html", "w", encoding="utf-8") as f:
+            f.write(resp.text)
+
+        logger.debug("Saved raw zones.html response to /tmp/zones_debug.html")
+
+        # Parse zones.html content
+        zones_soup = BeautifulSoup(resp.text, 'html.parser')
+        text = zones_soup.get_text("\n", strip=True)
+
+        # Extract alarm status from heading like "Τμήμα 1 : ΑΦΟΠΛΙΣΜΕΝΟ"
+        alarm_match = re.search(r"Τμήμα\s*\d+\s*:\s*(.+)", text)
+        alarm_status = alarm_match.group(1).strip() if alarm_match else None
+
+        # Extract battery voltage from "Μπαταρία: 13.5 Volt"
+        battery_match = re.search(r"Μπαταρία:\s*([\d.]+)\s*Volt", text)
+        battery_volt = float(battery_match.group(1)) if battery_match else None
+
+        # Extract AC power status from "Παροχή 230V: NAI"
+        ac_match = re.search(r"Παροχή\s*230V:\s*(ΝΑΙ|NAI|OXI|Yes|No)", text, re.IGNORECASE)
+        ac_power = ac_match.group(1) if ac_match else None
+
+        # Parse the zones table
+        table = zones_soup.find('table', class_='normaltable')
         zones = []
         if table:
-            for row in table.find_all('tr')[1:]:
+            for row in table.find_all('tr')[1:]:  # Skip header
                 cols = row.find_all('td')
                 if len(cols) >= 4:
                     zone_data = {
@@ -262,8 +309,14 @@ class SigmaClient:
                     }
                     logger.debug(f"Parsed zone: {zone_data}")
                     zones.append(zone_data)
-        return zones
 
+        return {
+            'alarm_status': alarm_status,
+            'battery_volt': battery_volt,
+            'ac_power': ac_power,
+            'zones': zones
+        }
+    
 if __name__ == "__main__":
     BASE_URL = os.getenv("SIGMA_BASE_URL")
     USERNAME = os.getenv("SIGMA_USERNAME")
@@ -282,21 +335,18 @@ if __name__ == "__main__":
                 client.perform_action(ACTION)
                 print(json.dumps({"action": ACTION, "success": True}))
             else:
-                client.login()
-                part_soup = client.select_partition(part_id='1')
-                status = client.get_part_status(part_soup)
-                zones = client.get_zones(part_soup)
+                data = client.safe_get_status()
 
-                parsed_status, zones_bypassed = _parse_alarm_status(status['alarm_status'])
+                parsed_status, zones_bypassed = _parse_alarm_status(data['alarm_status'])
 
-                if not parsed_status or status['battery_volt'] is None or not zones:
+                if not parsed_status or data['battery_volt'] is None or not data['zones']:
                     raise ValueError("Parsed data incomplete or invalid, retrying full flow")
 
                 output = {
                     "status": parsed_status,
                     "zones_bypassed": zones_bypassed,
-                    "battery_volt": status['battery_volt'],
-                    "ac_power": _to_bool(status['ac_power']),
+                    "battery_volt": data['battery_volt'],
+                    "ac_power": _to_bool(data['ac_power']),
                     "zones": [
                         {
                             "zone": z['zone'],
@@ -304,9 +354,11 @@ if __name__ == "__main__":
                             "status": _to_openclosed(z['status']),
                             "bypass": _to_bool(z['bypass'])
                         }
-                        for z in zones
+                        for z in data['zones']
                     ]
                 }
+
+                output["session_reused"] = client._session_authenticated
 
                 print(json.dumps(output, indent=2, ensure_ascii=False))
             break
